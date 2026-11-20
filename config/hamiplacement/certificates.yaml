@@ -1,0 +1,42 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: koord-hami-placement-selfsigned
+  namespace: koordinator-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: koord-hami-placement-ca
+  namespace: koordinator-system
+spec:
+  commonName: koord-hami-placement-ca
+  isCA: true
+  secretName: koord-hami-placement-ca
+  issuerRef:
+    name: koord-hami-placement-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: koord-hami-placement-ca
+  namespace: koordinator-system
+spec:
+  ca:
+    secretName: koord-hami-placement-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: koord-hami-placement-serving
+  namespace: koordinator-system
+spec:
+  dnsNames:
+    - koord-hami-placement.koordinator-system.svc
+  secretName: koord-hami-placement-serving
+  issuerRef:
+    name: koord-hami-placement-ca
+    kind: Issuer

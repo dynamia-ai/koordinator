@@ -171,10 +171,10 @@ func EvictPod(ctx context.Context, client clientset.Interface, pod *corev1.Pod, 
 	}
 	err := client.PolicyV1().Evictions(eviction.Namespace).Evict(ctx, eviction)
 	if apierrors.IsTooManyRequests(err) {
-		return fmt.Errorf("error when evicting pod (ignoring) %q: %v", pod.Name, err)
+		return fmt.Errorf("error when evicting pod (ignoring) %q: %w", pod.Name, err)
 	}
 	if apierrors.IsNotFound(err) {
-		return fmt.Errorf("pod not found when evicting %q: %v", pod.Name, err)
+		return fmt.Errorf("pod not found when evicting %q: %w", pod.Name, err)
 	}
 	return err
 }

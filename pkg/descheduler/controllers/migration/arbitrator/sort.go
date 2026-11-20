@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/koordinator-sh/koordinator/apis/scheduling/v1alpha1"
+	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/hamiplacement"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/fieldindex"
 	utilclient "github.com/koordinator-sh/koordinator/pkg/util/client"
 )
@@ -170,5 +171,9 @@ func getJobControllerOfPod(pod *corev1.Pod) (*metav1.OwnerReference, bool) {
 }
 
 func isJobMigrating(job *v1alpha1.PodMigrationJob) bool {
+	if hamiplacement.Requested(job.Annotations) {
+		return job.Annotations[hamiplacement.AnnotationPlacementOnly] != "true" &&
+			(hamiplacement.PassedArbitration(job) || job.Status.Phase == v1alpha1.PodMigrationJobRunning)
+	}
 	return job.Annotations[AnnotationPassedArbitration] == "true" || job.Status.Phase == v1alpha1.PodMigrationJobRunning
 }

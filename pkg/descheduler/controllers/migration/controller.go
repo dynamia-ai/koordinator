@@ -78,6 +78,9 @@ type Reconciler struct {
 	eventRecorder          events.EventRecorder
 	reservationInterpreter reservation.Interpreter
 	evictorInterpreter     evictor.Interpreter
+	hamiReader             client.Reader
+	hamiDryRun             bool
+	hamiEvict              func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error
 	controllerFinder       controllerfinder.Interface
 	assumedCache           *assumedCache
 	clock                  clock.Clock
@@ -131,7 +134,7 @@ func New(ctx context.Context, args runtime.Object, handle framework.Handle) (fra
 			}
 			r.assumedCache.delete(job)
 			// TODO(joseph): It's better that delete reservation asynchronously
-			if err = r.deleteReservation(context.TODO(), job); err != nil {
+			if err := r.deleteReservation(context.TODO(), job); err != nil {
 				klog.Errorf("Failed to delete reservation, MigrationJob: %s, err: %v", job.Name, err)
 			}
 			return true
@@ -163,6 +166,9 @@ func newReconciler(args *deschedulerconfig.MigrationControllerArgs, handle frame
 		eventRecorder:          handle.EventRecorder(),
 		reservationInterpreter: reservationInterpreter,
 		evictorInterpreter:     evictorInterpreter,
+		hamiReader:             manager.GetAPIReader(),
+		hamiDryRun:             handle.IsDryRun(),
+		hamiEvict:              evictorInterpreter.EvictNative,
 		controllerFinder:       controllerFinder,
 		assumedCache:           newAssumedCache(),
 		clock:                  clock.RealClock{},
@@ -205,6 +211,11 @@ func (r *Reconciler) doScavenge() {
 	}
 	for i := range jobList.Items {
 		v := &jobList.Items[i]
+		// Retain failed HAMi placements until the orchestrator explicitly
+		// retires them. Removing an armed placement could allow fallback.
+		if isHamiJob(v) {
+			continue
+		}
 		timeoutDuration := 30 * time.Minute
 		if v.Spec.TTL != nil && v.Spec.TTL.Duration > 0 {
 			timeoutDuration = v.Spec.TTL.Duration + 5*time.Minute
@@ -285,6 +296,9 @@ func (r *Reconciler) getPodByJob(ctx context.Context, job *sev1alpha1.PodMigrati
 
 func (r *Reconciler) doMigrate(ctx context.Context, job *sev1alpha1.PodMigrationJob) (reconcile.Result, error) {
 	klog.V(4).Infof("begin process MigrationJob %s", job.Name)
+	if isHamiJob(job) {
+		return r.migrateHami(ctx, job)
+	}
 	if job.Spec.Paused {
 		return reconcile.Result{}, nil
 	}

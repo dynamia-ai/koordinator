@@ -45,12 +45,15 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	deschedulerappconfig "github.com/koordinator-sh/koordinator/cmd/koord-descheduler/app/config"
 	deschedulerconfig "github.com/koordinator-sh/koordinator/pkg/descheduler/apis/config"
 	deschedulerscheme "github.com/koordinator-sh/koordinator/pkg/descheduler/apis/config/scheme"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/apis/config/v1alpha2"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/apis/config/validation"
+	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/hamiplacement"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/informers"
 	utilclient "github.com/koordinator-sh/koordinator/pkg/util/client"
 	utilfeature "github.com/koordinator-sh/koordinator/pkg/util/feature"
@@ -81,6 +84,8 @@ type Options struct {
 
 	// WriteConfigTo is the path where the default configuration will be written.
 	WriteConfigTo string
+
+	HamiPlacementCertDir string
 
 	// Flags hold the parsed CLI flags.
 	Flags *cliflag.NamedFlagSets
@@ -167,6 +172,8 @@ func (o *Options) initFlags() {
 	fs := nfs.FlagSet("misc")
 	fs.StringVar(&o.ConfigFile, "config", o.ConfigFile, "The path to the configuration file.")
 	fs.StringVar(&o.WriteConfigTo, "write-config-to", o.WriteConfigTo, "If set, write the configuration values to this file and exit.")
+
+	fs.StringVar(&o.HamiPlacementCertDir, "hami-placement-webhook-cert-dir", "", "Enable the HAMi placement webhook on port 9443 with tls.crt and tls.key from this directory.")
 
 	o.SecureServing.AddFlags(nfs.FlagSet("secure serving"))
 	o.CombinedInsecureServing.AddFlags(nfs.FlagSet("insecure serving"))
@@ -268,16 +275,26 @@ func (o *Options) Config() (*deschedulerappconfig.Config, error) {
 	mgrKubeConfig := restclient.CopyConfig(kubeConfig)
 	mgrKubeConfig.ContentType = ""
 	mgrKubeConfig.AcceptContentTypes = ""
-	mgr, err := ctrl.NewManager(mgrKubeConfig, ctrl.Options{
+	managerOptions := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
 		LeaderElection:         false,
 		Cache:                  cache.Options{SyncPeriod: nil},
 		NewClient:              utilclient.NewClient,
-	})
+	}
+	if o.HamiPlacementCertDir != "" {
+		managerOptions.WebhookServer = webhook.NewServer(webhook.Options{Port: 9443, CertDir: o.HamiPlacementCertDir})
+	}
+	mgr, err := ctrl.NewManager(mgrKubeConfig, managerOptions)
 	if err != nil {
 		return nil, fmt.Errorf("unable to start manager, err: %w", err)
+	}
+
+	if o.HamiPlacementCertDir != "" {
+		mgr.GetWebhookServer().Register(hamiplacement.WebhookPath, &admission.Webhook{
+			Handler: hamiplacement.Webhook{Reader: mgr.GetAPIReader(), Decoder: admission.NewDecoder(mgr.GetScheme())},
+		})
 	}
 
 	c.Manager = mgr

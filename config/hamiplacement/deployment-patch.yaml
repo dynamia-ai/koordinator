@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: koord-descheduler
+  namespace: koordinator-system
+spec:
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      containers:
+        - name: descheduler
+          imagePullPolicy: IfNotPresent
+          args:
+            - --v=4
+            - --config=/config/koord-descheduler.config
+            - --hami-placement-webhook-cert-dir=/hami-placement-tls
+          ports:
+            - name: placement-https
+              containerPort: 9443
+          readinessProbe:
+            httpGet: null
+            tcpSocket:
+              port: placement-https
+          volumeMounts:
+            - name: hami-placement-tls
+              mountPath: /hami-placement-tls
+              readOnly: true
+      volumes:
+        - name: hami-placement-tls
+          secret:
+            secretName: koord-hami-placement-serving

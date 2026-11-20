@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/koordinator-sh/koordinator/apis/scheduling/v1alpha1"
+	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/hamiplacement"
 )
 
 // arbitrationHandler implement handler.EventHandler
@@ -49,6 +50,18 @@ func (h *arbitrationHandler) Create(ctx context.Context, evt event.TypedCreateEv
 		return
 	}
 	job := evt.Object.(*v1alpha1.PodMigrationJob)
+	if hamiplacement.Requested(job.Annotations) {
+		q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)})
+		// Placement-only never evicts. The external caller retains eviction
+		// authority. Already arbitrated jobs must resume without re-arbitration.
+		if job.Annotations[hamiplacement.AnnotationPlacementOnly] == "true" ||
+			job.Spec.Paused || hamiplacement.PassedArbitration(job) ||
+			job.Status.Phase == v1alpha1.PodMigrationJobFailed ||
+			job.Status.Phase == v1alpha1.PodMigrationJobSucceeded ||
+			job.Status.Phase == v1alpha1.PodMigrationJobAborted {
+			return
+		}
+	}
 	h.arbitrator.AddPodMigrationJob(job)
 }
 
@@ -61,6 +74,11 @@ func (h *arbitrationHandler) Update(ctx context.Context, evt event.TypedUpdateEv
 			Namespace: evt.ObjectNew.GetNamespace(),
 		}})
 		job := evt.ObjectNew.(*v1alpha1.PodMigrationJob)
+		if hamiplacement.Requested(job.Annotations) && !hamiplacement.PassedArbitration(job) &&
+			job.Annotations[hamiplacement.AnnotationPlacementOnly] != "true" && !job.Spec.Paused &&
+			(job.Status.Phase == "" || job.Status.Phase == v1alpha1.PodMigrationJobPending) {
+			h.arbitrator.AddPodMigrationJob(job)
+		}
 		if job.Status.Phase == v1alpha1.PodMigrationJobFailed ||
 			job.Status.Phase == v1alpha1.PodMigrationJobSucceeded ||
 			job.Status.Phase == v1alpha1.PodMigrationJobAborted {

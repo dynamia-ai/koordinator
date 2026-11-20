@@ -19,6 +19,7 @@ package arbitrator
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +37,7 @@ import (
 	sev1alpha1 "github.com/koordinator-sh/koordinator/apis/scheduling/v1alpha1"
 	deschedulerconfig "github.com/koordinator-sh/koordinator/pkg/descheduler/apis/config"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/controllerfinder"
+	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/hamiplacement"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/util"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/options"
 	evictionsutil "github.com/koordinator-sh/koordinator/pkg/descheduler/evictions"
@@ -53,6 +55,7 @@ type filter struct {
 	clock  clock.RealClock
 
 	nonRetryablePodFilter framework.FilterFunc
+	hamiEmptyDirPodFilter framework.FilterFunc
 	retryablePodFilter    framework.FilterFunc
 	defaultFilterPlugin   framework.FilterPlugin
 
@@ -175,23 +178,32 @@ func (f *filter) initFilters(args *deschedulerconfig.MigrationControllerArgs, ha
 		}
 		return nodes, nil
 	}
-	filterPlugin, err := evictionsutil.NewEvictorFilter(nodeGetter, handle.GetPodsAssignedToNodeFunc(), evictLocalStoragePods,
-		evictSystemCriticalPods, ignorePvcPods, evictFailedBarePods, evictAllBarePods,
-		evictionsutil.WithLabelSelector(labelSelector), evictionsutil.WithPriorityThreshold(priority))
+	buildNonRetryableFilter := func(allowLocalStorage bool) (framework.FilterFunc, error) {
+		filterPlugin, err := evictionsutil.NewEvictorFilter(nodeGetter, handle.GetPodsAssignedToNodeFunc(), allowLocalStorage,
+			evictSystemCriticalPods, ignorePvcPods, evictFailedBarePods, evictAllBarePods,
+			evictionsutil.WithLabelSelector(labelSelector), evictionsutil.WithPriorityThreshold(priority))
+		if err != nil {
+			return nil, err
+		}
+		filters := podutil.WrapFilterFuncs(util.FilterPodWithMaxEvictionCost, filterPlugin.Filter)
+		if !f.isEvictionGateSkipped(deschedulerconfig.EvictionGateExpectedReplicas) {
+			filters = podutil.WrapFilterFuncs(filters, f.filterExpectedReplicas)
+		}
+		return podutil.NewOptions().
+			WithFilter(filters).
+			WithNamespaces(includedNamespaces).
+			WithoutNamespaces(excludedNamespaces).
+			BuildFilterFunc()
+	}
+	podFilter, err := buildNonRetryableFilter(evictLocalStoragePods)
 	if err != nil {
 		return err
 	}
-	wrapFilterFuncs := podutil.WrapFilterFuncs(util.FilterPodWithMaxEvictionCost, filterPlugin.Filter)
-	if !f.isEvictionGateSkipped(deschedulerconfig.EvictionGateExpectedReplicas) {
-		wrapFilterFuncs = podutil.WrapFilterFuncs(wrapFilterFuncs, f.filterExpectedReplicas)
-	}
-	podFilter, err := podutil.NewOptions().
-		WithFilter(wrapFilterFuncs).
-		WithNamespaces(includedNamespaces).
-		WithoutNamespaces(excludedNamespaces).
-		BuildFilterFunc()
-	if err != nil {
-		return err
+	if !evictLocalStoragePods {
+		f.hamiEmptyDirPodFilter, err = buildNonRetryableFilter(true)
+		if err != nil {
+			return err
+		}
 	}
 	var retryableFilterFuncs []framework.FilterFunc
 	if !f.isEvictionGateSkipped(deschedulerconfig.EvictionGateMaxMigratingGlobally) {
@@ -218,6 +230,41 @@ func (f *filter) initFilters(args *deschedulerconfig.MigrationControllerArgs, ha
 	}
 	f.defaultFilterPlugin = defaultEvictor.(framework.FilterPlugin)
 	return nil
+}
+
+func (f *filter) allowsHamiEmptyDir(job *sev1alpha1.PodMigrationJob, pod *corev1.Pod) (bool, error) {
+	if f.hamiEmptyDirPodFilter == nil || job == nil || job.Spec.PodRef == nil ||
+		job.Spec.Mode != sev1alpha1.PodMigrationJobModeEvictionDirectly ||
+		job.Spec.PodRef.UID == "" || job.Spec.PodRef.UID != pod.UID ||
+		job.Spec.PodRef.Namespace != pod.Namespace || job.Spec.PodRef.Name != pod.Name ||
+		pod.Labels[hamiplacement.RecoveryEvictableLabel] != "true" ||
+		pod.Spec.SchedulerName != hamiplacement.SchedulerName || pod.Spec.NodeName == "" ||
+		hamiplacement.ReplicaSetOwner(pod) == nil ||
+		strings.TrimSpace(job.Annotations[hamiplacement.AnnotationNode]) == "" ||
+		strings.TrimSpace(job.Annotations[hamiplacement.AnnotationUUIDs]) == "" {
+		return false, nil
+	}
+	if _, placementOnly := job.Annotations[hamiplacement.AnnotationPlacementOnly]; placementOnly {
+		return false, nil
+	}
+
+	hasEmptyDir := false
+	for _, volume := range pod.Spec.Volumes {
+		// A mixed volume set keeps the normal storage policy. Local persistent
+		// claims and driver-backed volumes are outside this exemption.
+		if volume.HostPath != nil || volume.PersistentVolumeClaim != nil || volume.Ephemeral != nil || volume.CSI != nil {
+			return false, nil
+		}
+		hasEmptyDir = hasEmptyDir || volume.EmptyDir != nil
+	}
+	if !hasEmptyDir {
+		return false, nil
+	}
+	namespace := &corev1.Namespace{}
+	if err := f.client.Get(context.TODO(), client.ObjectKey{Name: pod.Namespace}, namespace); err != nil {
+		return false, err
+	}
+	return namespace.Labels[hamiplacement.ManagedNamespaceLabel] == "true", nil
 }
 
 func (f *filter) reservationFilter(pod *corev1.Pod) bool {
@@ -256,7 +303,7 @@ func (f *filter) forEachAvailableMigrationJobs(listOpts *client.ListOptions, han
 		}
 		found := false
 		for _, v := range expectedPhaseContexts {
-			if phase == v.phase && (!v.checkArbitration || f.checkJobPassedArbitration(job.UID)) {
+			if phase == v.phase && (!v.checkArbitration || f.checkJobPassedArbitration(job.UID) || hamiplacement.PassedArbitration(job)) {
 				found = true
 				break
 			}
@@ -268,13 +315,16 @@ func (f *filter) forEachAvailableMigrationJobs(listOpts *client.ListOptions, han
 }
 
 func (f *filter) filterExistingPodMigrationJob(pod *corev1.Pod) bool {
-	return !f.existingPodMigrationJob(pod)
+	return !f.existingPodMigrationJob(pod, false)
 }
 
-func (f *filter) existingPodMigrationJob(pod *corev1.Pod, expectedPhaseContexts ...phaseContext) bool {
+func (f *filter) existingPodMigrationJob(pod *corev1.Pod, evictionOnly bool, expectedPhaseContexts ...phaseContext) bool {
 	opts := &client.ListOptions{FieldSelector: fields.OneTermEqualSelector(fieldindex.IndexJobByPodUID, string(pod.UID))}
 	existing := false
 	f.forEachAvailableMigrationJobs(opts, func(job *sev1alpha1.PodMigrationJob) bool {
+		if evictionOnly && job.Annotations[hamiplacement.AnnotationPlacementOnly] == "true" {
+			return true
+		}
 		if podRef := job.Spec.PodRef; podRef != nil && podRef.UID == pod.UID {
 			existing = true
 		}
@@ -284,6 +334,9 @@ func (f *filter) existingPodMigrationJob(pod *corev1.Pod, expectedPhaseContexts 
 	if !existing {
 		opts = &client.ListOptions{FieldSelector: fields.OneTermEqualSelector(fieldindex.IndexJobPodNamespacedName, fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))}
 		f.forEachAvailableMigrationJobs(opts, func(job *sev1alpha1.PodMigrationJob) bool {
+			if evictionOnly && job.Annotations[hamiplacement.AnnotationPlacementOnly] == "true" {
+				return true
+			}
 			if podRef := job.Spec.PodRef; podRef != nil && podRef.Namespace == pod.Namespace && podRef.Name == pod.Name {
 				existing = true
 			}
@@ -312,6 +365,9 @@ func (f *filter) filterMaxMigratingGlobally(pod *corev1.Pod) bool {
 	count := 0
 	listOpts := &client.ListOptions{}
 	f.forEachAvailableMigrationJobs(listOpts, func(job *sev1alpha1.PodMigrationJob) bool {
+		if job.Annotations[hamiplacement.AnnotationPlacementOnly] == "true" {
+			return true
+		}
 		if podRef := job.Spec.PodRef; podRef != nil && podRef.UID != pod.UID {
 			count++
 		}
@@ -358,7 +414,7 @@ func (f *filter) filterMaxMigratingPerNode(pod *corev1.Pod) bool {
 		v := &podList.Items[i]
 		if v.UID != pod.UID &&
 			v.Spec.NodeName == pod.Spec.NodeName &&
-			f.existingPodMigrationJob(v, expectedPhaseContexts...) {
+			f.existingPodMigrationJob(v, true, expectedPhaseContexts...) {
 			count++
 		}
 	}
@@ -391,6 +447,9 @@ func (f *filter) filterMaxMigratingPerNamespace(pod *corev1.Pod) bool {
 	opts := &client.ListOptions{FieldSelector: fields.OneTermEqualSelector(fieldindex.IndexJobByPodNamespace, pod.Namespace)}
 	count := 0
 	f.forEachAvailableMigrationJobs(opts, func(job *sev1alpha1.PodMigrationJob) bool {
+		if job.Annotations[hamiplacement.AnnotationPlacementOnly] == "true" {
+			return true
+		}
 		if podRef := job.Spec.PodRef; podRef != nil && podRef.UID != pod.UID && podRef.Namespace == pod.Namespace {
 			count++
 		}
@@ -448,7 +507,7 @@ func (f *filter) filterMaxMigratingOrUnavailablePerWorkload(pod *corev1.Pod) boo
 	migratingPods := map[types.NamespacedName]struct{}{}
 	f.forEachAvailableMigrationJobs(opts, func(job *sev1alpha1.PodMigrationJob) bool {
 		podRef := job.Spec.PodRef
-		if podRef == nil || podRef.UID == pod.UID {
+		if job.Annotations[hamiplacement.AnnotationPlacementOnly] == "true" || podRef == nil || podRef.UID == pod.UID {
 			return true
 		}
 
