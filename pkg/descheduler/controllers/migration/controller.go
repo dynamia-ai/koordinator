@@ -19,7 +19,6 @@ package migration
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -264,9 +263,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	// NOTE:
 	// 1. only the PMJs created by MigrationController have annotation AnnotationJobCreatedBy, if a PMJ was created
 	//    manually by users, we should handle it anyway.
-	// A persisted eviction checkpoint still needs reconciliation across leaders.
+	// Verified HAMi placement state survives process ownership, including
+	// replacement scheduling and cleanup after eviction recovery.
 	if jobUID, ok := job.Annotations[AnnotationJobCreatedBy]; ok && jobUID != string(r.reconcilerUID) &&
-		!slices.Contains(job.Finalizers, hamiEvictionRecoveryFinalizer) {
+		!hamiJobManaged(job) {
 		return reconcile.Result{}, nil
 	}
 

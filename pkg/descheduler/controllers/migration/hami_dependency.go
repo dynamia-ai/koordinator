@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,12 +37,25 @@ const (
 	hamiDependentEvictionAnnotation = "hami.io/dependent-eviction-intent"
 	hamiEvictionFenceAnnotation     = "hami.io/eviction-attempt-fence"
 	hamiEvictionDependencyCondition = "HamiEvictionDependencyCheckpoint"
+	hamiEvictionPreparationTime     = 15 * time.Second
 )
 
 type hamiDependencyCheckpoint struct {
-	Destination corev1.ObjectReference `json:"destination"`
-	Target      corev1.ObjectReference `json:"target"`
-	Marker      string                 `json:"marker"`
+	Destination  corev1.ObjectReference `json:"destination"`
+	Target       corev1.ObjectReference `json:"target"`
+	Marker       string                 `json:"marker"`
+	PrepareUntil metav1.MicroTime       `json:"prepareUntil,omitempty"`
+}
+
+func (c hamiDependencyCheckpoint) attempt() string {
+	return string(c.Destination.UID) + "/" + c.Marker
+}
+
+func (r *Reconciler) hamiDependencyPreparing(job *sev1alpha1.PodMigrationJob) bool {
+	_, condition := util.GetCondition(&job.Status, hamiEvictionDependencyCondition)
+	var checkpoint hamiDependencyCheckpoint
+	return condition != nil && json.Unmarshal([]byte(condition.Message), &checkpoint) == nil &&
+		r.clock.Now().Before(checkpoint.PrepareUntil.Time)
 }
 
 func (r *Reconciler) readHamiReservation(ctx context.Context, namespace, name string) (*unstructured.Unstructured, error) {
@@ -76,6 +90,10 @@ func (r *Reconciler) hamiEvictionDependency(ctx context.Context, source *corev1.
 		(phase != "Protecting" && phase != "Reserved") || target.GetAnnotations()[hamiDependentEvictionAnnotation] != expectedMarker {
 		return nil, nil
 	}
+	active, err := r.activeHamiTargetOwner(ctx, target)
+	if !active || err != nil {
+		return nil, err
+	}
 	return target, nil
 }
 
@@ -86,9 +104,10 @@ func hamiReservationReference(reservation *unstructured.Unstructured) corev1.Obj
 	}
 }
 
-func (r *Reconciler) checkpointHamiDependency(ctx context.Context, job *sev1alpha1.PodMigrationJob, reservation, target *unstructured.Unstructured, marker string) error {
+func (r *Reconciler) checkpointHamiDependency(ctx context.Context, job *sev1alpha1.PodMigrationJob, reservation, target *unstructured.Unstructured, marker string, prepareUntil time.Time) error {
 	payload, err := json.Marshal(hamiDependencyCheckpoint{
-		Destination: hamiReservationReference(reservation), Target: hamiReservationReference(target), Marker: marker,
+		Destination: hamiReservationReference(reservation), Target: hamiReservationReference(target),
+		Marker: marker, PrepareUntil: metav1.NewMicroTime(prepareUntil),
 	})
 	if err != nil {
 		return err
@@ -112,12 +131,18 @@ func (r *Reconciler) recoverHamiDependentEviction(ctx context.Context, job *sev1
 	if source.Name == "" || source.UID == "" || source.ResourceVersion == "" {
 		return fmt.Errorf("PodMigrationJob %s has an invalid dependency checkpoint", job.Name)
 	}
-	attempt := string(checkpoint.Destination.UID) + "/" + checkpoint.Marker
+	attempt := checkpoint.attempt()
 	_, started := util.GetCondition(&job.Status, hamiEvictionStartCondition)
 	_, outcome := util.GetCondition(&job.Status, hamiEvictionOutcomeCondition)
 	recorded := outcome != nil && outcome.Status == sev1alpha1.PodMigrationJobConditionStatusTrue && outcome.Message == attempt
 	submissionAuthorized := started != nil && started.Status == sev1alpha1.PodMigrationJobConditionStatusTrue && started.Message == attempt
 	if !recorded && !submissionAuthorized {
+		// A healthy writer has a bounded window to finish the two pin
+		// writes. Once start commits only its result can settle the attempt.
+		if job.DeletionTimestamp.IsZero() && !job.Spec.Paused && hamiJobActive(job) &&
+			r.clock.Now().Before(checkpoint.PrepareUntil.Time) {
+			return nil
+		}
 		// Race the submitter's start checkpoint using the same PMJ version.
 		// Fencing the reservation versions below then closes late pin writes.
 		eviction := &sev1alpha1.PodMigrationJobCondition{
