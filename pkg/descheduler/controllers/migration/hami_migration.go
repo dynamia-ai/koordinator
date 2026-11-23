@@ -370,6 +370,13 @@ func (r *Reconciler) migrateHami(ctx context.Context, job *sev1alpha1.PodMigrati
 		if err != nil {
 			return reconcile.Result{}, err
 		}
+		_, held := reservation.GetAnnotations()[hamiSourceEvictionAnnotation]
+		if reservation.GetDeletionTimestamp() != nil && (deferredGrant || !held) {
+			return r.failHami(ctx, job, "GPUReservationUnavailable", "GPUReservation is being deleted")
+		}
+		if held {
+			return hamiRequeue, nil
+		}
 		if deferredGrant {
 			managed, err := r.manageHamiTarget(ctx, job, reservation)
 			if !managed || err != nil {
@@ -379,12 +386,6 @@ func (r *Reconciler) migrateHami(ctx context.Context, job *sev1alpha1.PodMigrati
 			if changed || err != nil {
 				return hamiRequeue, err
 			}
-		}
-		if _, held := reservation.GetAnnotations()[hamiSourceEvictionAnnotation]; held {
-			return hamiRequeue, nil
-		}
-		if reservation.GetDeletionTimestamp() != nil {
-			return r.failHami(ctx, job, "GPUReservationUnavailable", "Armed GPUReservation is being deleted")
 		}
 		switch phase := reservationPhase(reservation); phase {
 		case "Pending", "":

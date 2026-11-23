@@ -37,7 +37,9 @@ const (
 	hamiDependentEvictionAnnotation = "hami.io/dependent-eviction-intent"
 	hamiEvictionFenceAnnotation     = "hami.io/eviction-attempt-fence"
 	hamiEvictionDependencyCondition = "HamiEvictionDependencyCheckpoint"
-	hamiEvictionPreparationTime     = 15 * time.Second
+	hamiEvictionUnknownCondition    = "HamiEvictionOutcomeUnknown"
+	// Only a preparation without a committed start can be taken over.
+	hamiEvictionPreparationTime = 15 * time.Second
 )
 
 type hamiDependencyCheckpoint struct {
@@ -137,8 +139,7 @@ func (r *Reconciler) recoverHamiDependentEviction(ctx context.Context, job *sev1
 	recorded := outcome != nil && outcome.Status == sev1alpha1.PodMigrationJobConditionStatusTrue && outcome.Message == attempt
 	submissionAuthorized := started != nil && started.Status == sev1alpha1.PodMigrationJobConditionStatusTrue && started.Message == attempt
 	if !recorded && !submissionAuthorized {
-		// A healthy writer has a bounded window to finish the two pin
-		// writes. Once start commits only its result can settle the attempt.
+		// A healthy writer has a bounded window to finish the two pin writes.
 		if job.DeletionTimestamp.IsZero() && !job.Spec.Paused && hamiJobActive(job) &&
 			r.clock.Now().Before(checkpoint.PrepareUntil.Time) {
 			return nil
@@ -156,15 +157,44 @@ func (r *Reconciler) recoverHamiDependentEviction(ctx context.Context, job *sev1
 		outcome, recorded = eviction, true
 	}
 	rejected := recorded && (outcome.Reason == "HamiEvictionDeferred" || outcome.Reason == "HamiEvictionBlocked")
+	sourceExists := false
 	if !rejected {
 		pod := &corev1.Pod{}
 		err := r.hamiReader.Get(ctx, client.ObjectKey{Namespace: checkpoint.Target.Namespace, Name: source.Name}, pod)
 		if client.IgnoreNotFound(err) != nil {
 			return err
 		}
-		if err == nil && pod.UID == source.UID {
-			return nil
+		sourceExists = err == nil && pod.UID == source.UID
+	}
+	if sourceExists && !recorded {
+		// Kubernetes does not tie the Eviction API result to our PMJ CAS.
+		// A committed start and a live source are consistent with both a
+		// crash before the request and an Eviction still in flight.
+		if util.UpdateCondition(&job.Status, &sev1alpha1.PodMigrationJobCondition{
+			Type: hamiEvictionUnknownCondition, Status: sev1alpha1.PodMigrationJobConditionStatusTrue,
+			Reason: "AwaitingEvictionEvidence",
+			Message: fmt.Sprintf("Eviction outcome for attempt %s is unknown. Waiting for Pod %s/%s UID %s to disappear or for a definitive result for the same attempt. Accepted evictions stay pinned until the source UID disappears. The preparation deadline governs takeover before start.",
+				source.Attempt, checkpoint.Target.Namespace, source.Name, source.UID),
+		}) {
+			return r.Status().Update(ctx, job)
 		}
+		return nil
+	}
+	if _, unknown := util.GetCondition(&job.Status, hamiEvictionUnknownCondition); unknown != nil && unknown.Status == sev1alpha1.PodMigrationJobConditionStatusTrue {
+		reason := "SourcePodUIDGone"
+		if recorded {
+			reason = "EvictionOutcomeRecorded"
+		}
+		util.UpdateCondition(&job.Status, &sev1alpha1.PodMigrationJobCondition{
+			Type: hamiEvictionUnknownCondition, Status: sev1alpha1.PodMigrationJobConditionStatusFalse,
+			Reason: reason, Message: source.Attempt,
+		})
+		if err := r.Status().Update(ctx, job); err != nil {
+			return err
+		}
+	}
+	if sourceExists {
+		return nil
 	}
 	if err := r.settleHamiDependencyPin(ctx, checkpoint.Destination, hamiSourceEvictionAnnotation, checkpoint.Marker); err != nil {
 		return err

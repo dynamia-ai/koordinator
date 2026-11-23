@@ -1614,3 +1614,160 @@ func TestHamiEvictionOutcomeRechecksAttemptAfterConflict(t *testing.T) {
 	require.Equal(t, newAttempt, outcome.Message)
 	require.Equal(t, "HamiEvictionBlocked", outcome.Reason)
 }
+
+func TestHamiDeferredTargetDeletingBeforeOwnershipTransferFails(t *testing.T) {
+	f := newHamiFixture(t, true)
+	f.job.Annotations[hamiplacement.AnnotationTargetOccupants] = `["small-uid"]`
+	require.NoError(t, f.Update(t.Context(), f.job))
+	for range 3 {
+		f.step(t)
+	}
+	placement, err := hamiTarget(f.job)
+	require.NoError(t, err)
+	target, err := f.hamiReservation(t.Context(), f.job, placement, true)
+	require.NoError(t, err)
+	f.setPhase(t, "Protecting")
+	require.NoError(t, f.Delete(t.Context(), target))
+
+	f.step(t)
+	require.Equal(t, sev1alpha1.PodMigrationJobFailed, f.job.Status.Phase)
+	require.Equal(t, "GPUReservationUnavailable", f.job.Status.Reason)
+	require.Empty(t, f.job.Annotations[hamiplacement.AnnotationTargetUID])
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.NotNil(t, target.GetDeletionTimestamp())
+	require.Equal(t, []metav1.OwnerReference{hamiJobOwner(f.job)}, target.GetOwnerReferences())
+	require.Empty(t, target.GetAnnotations()[hamiTargetOwnerAnnotation])
+	require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+	source := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: target.GetNamespace(), UID: "small-uid"},
+		Spec: corev1.PodSpec{NodeName: placement.NodeName}}
+	dependency, err := f.hamiEvictionDependency(t.Context(), source, &hamiplacement.ReservationReference{Name: target.GetName(), UID: target.GetUID()}, "")
+	require.NoError(t, err)
+	require.Nil(t, dependency)
+
+	f.step(t)
+	require.Contains(t, f.job.Finalizers, hamiTargetOwnerFinalizer)
+	f.setPhase(t, "Expired")
+	f.step(t)
+	require.NotContains(t, f.job.Finalizers, hamiTargetOwnerFinalizer)
+}
+
+func TestHamiDependentEvictionPreparationDeadlineStartCAS(t *testing.T) {
+	for _, startWins := range []bool{false, true} {
+		t.Run(fmt.Sprint("start-wins=", startWins), func(t *testing.T) {
+			f, target := armHamiDependentMigration(t)
+			destination := gpuReservationObject(f.job)
+			base := f.Client.(client.WithWatch)
+			other := &Reconciler{Client: base, hamiReader: base, args: f.args, clock: f.now}
+			reachedStart := false
+			f.Client = interceptor.NewClient(base, interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, c client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if job, ok := obj.(*sev1alpha1.PodMigrationJob); ok && !reachedStart {
+						if _, started := util.GetCondition(&job.Status, hamiEvictionStartCondition); started != nil {
+							reachedStart = true
+							f.now.Step(hamiEvictionPreparationTime)
+							if startWins {
+								require.NoError(t, c.SubResource(subresource).Update(ctx, obj, opts...))
+								panic("start committed before submitter exited")
+							}
+							live := &sev1alpha1.PodMigrationJob{}
+							require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(job), live))
+							_, err := other.doMigrate(ctx, live)
+							require.NoError(t, err)
+						}
+					}
+					return c.SubResource(subresource).Update(ctx, obj, opts...)
+				},
+			})
+			f.hamiEvict = func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error {
+				t.Fatal("an expired preparer must not send Eviction")
+				return nil
+			}
+			if startWins {
+				require.PanicsWithValue(t, "start committed before submitter exited", func() { _, _ = f.doMigrate(t.Context(), f.job) })
+			} else {
+				_, err := f.doMigrate(t.Context(), f.job)
+				require.True(t, apierrors.IsConflict(err), "recovery must fence the pending start write")
+			}
+			require.True(t, reachedStart)
+
+			f.Reconciler = other
+			if startWins {
+				require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source))
+				f.source.Finalizers = []string{"test.example/keep-source"}
+				require.NoError(t, f.Update(t.Context(), f.source))
+				require.NoError(t, f.Delete(t.Context(), f.source))
+				f.now.Step(time.Minute)
+			}
+			f.step(t)
+			require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(destination), destination))
+			require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+			_, unknown := util.GetCondition(&f.job.Status, "HamiEvictionOutcomeUnknown")
+			if !startWins {
+				require.Nil(t, unknown)
+				require.Empty(t, destination.GetAnnotations()[hamiSourceEvictionAnnotation])
+				require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+				require.NotContains(t, f.job.Finalizers, hamiEvictionRecoveryFinalizer)
+				return
+			}
+			require.NotNil(t, unknown)
+			require.Equal(t, sev1alpha1.PodMigrationJobConditionStatusTrue, unknown.Status)
+			require.Contains(t, unknown.Message, string(f.source.UID))
+			require.Contains(t, unknown.Message, "definitive result for the same attempt")
+			require.NotEmpty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+			require.Equal(t, target.GetAnnotations()[hamiDependentEvictionAnnotation], destination.GetAnnotations()[hamiSourceEvictionAnnotation])
+			require.Contains(t, f.job.Finalizers, hamiEvictionRecoveryFinalizer)
+
+			require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source))
+			require.NotNil(t, f.source.GetDeletionTimestamp())
+			f.source.Finalizers = nil
+			require.NoError(t, f.Update(t.Context(), f.source))
+			f.step(t)
+			_, unknown = util.GetCondition(&f.job.Status, "HamiEvictionOutcomeUnknown")
+			require.Equal(t, sev1alpha1.PodMigrationJobConditionStatusFalse, unknown.Status)
+			require.Equal(t, "SourcePodUIDGone", unknown.Reason)
+			require.NotContains(t, f.job.Finalizers, hamiEvictionRecoveryFinalizer)
+			require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(destination), destination))
+			require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+			require.Empty(t, destination.GetAnnotations()[hamiSourceEvictionAnnotation])
+			require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+		})
+	}
+}
+
+func TestHamiDependentEvictionUnknownConditionSettlesOnExactOutcome(t *testing.T) {
+	for _, accepted := range []bool{false, true} {
+		t.Run(fmt.Sprint("accepted=", accepted), func(t *testing.T) {
+			f, target := armHamiDependentMigration(t)
+			destination := gpuReservationObject(f.job)
+			observer := &Reconciler{Client: f.Client, hamiReader: f.hamiReader, args: f.args, clock: f.now}
+			calls := 0
+			f.hamiEvict = func(ctx context.Context, _ *sev1alpha1.PodMigrationJob, _ *corev1.Pod) error {
+				calls++
+				current := &sev1alpha1.PodMigrationJob{}
+				require.NoError(t, f.Get(ctx, client.ObjectKeyFromObject(f.job), current))
+				_, err := observer.doMigrate(ctx, current)
+				require.NoError(t, err)
+				_, unknown := util.GetCondition(&current.Status, hamiEvictionUnknownCondition)
+				require.NotNil(t, unknown)
+				require.Equal(t, sev1alpha1.PodMigrationJobConditionStatusTrue, unknown.Status)
+				if accepted {
+					return nil
+				}
+				return apierrors.NewTooManyRequests("PDB rejected this attempt", 0)
+			}
+			f.step(t)
+			f.step(t)
+			require.Equal(t, 1, calls)
+			_, unknown := util.GetCondition(&f.job.Status, hamiEvictionUnknownCondition)
+			require.NotNil(t, unknown)
+			require.Equal(t, sev1alpha1.PodMigrationJobConditionStatusFalse, unknown.Status)
+			require.Equal(t, "EvictionOutcomeRecorded", unknown.Reason)
+
+			require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+			require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(destination), destination))
+			targetPin, destinationPin := target.GetAnnotations()[hamiDependentEvictionAnnotation], destination.GetAnnotations()[hamiSourceEvictionAnnotation]
+			require.Equal(t, targetPin, destinationPin)
+			require.Equal(t, accepted, targetPin != "", "acceptance preserves both pins while the original UID exists")
+		})
+	}
+}
