@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sev1alpha1 "github.com/koordinator-sh/koordinator/apis/scheduling/v1alpha1"
 	deschedulerconfig "github.com/koordinator-sh/koordinator/pkg/descheduler/apis/config"
@@ -123,7 +124,7 @@ func newHamiFixture(t *testing.T, placementOnly bool) *hamiFixture {
 			if cm, ok := obj.(*corev1.ConfigMap); ok {
 				cm.UID = "placement-uid"
 			}
-			if obj.GetObjectKind().GroupVersionKind() == gpuReservationGVK {
+			if obj.GetObjectKind().GroupVersionKind() == gpuReservationGVK && obj.GetUID() == "" {
 				obj.SetUID("reservation-uid")
 			}
 			return c.Create(ctx, obj, opts...)
@@ -153,13 +154,14 @@ func (f *hamiFixture) setPhase(t *testing.T, phase string) {
 	t.Helper()
 	obj := gpuReservationObject(f.job)
 	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))
-	if phase == "Reserved" && !reservationProtected(obj) {
+	protected := phase == "Reserved" || phase == "Protecting"
+	if protected && !reservationProtected(obj) {
 		obj.SetFinalizers([]string{gpuReservationProtectionFinalizer})
 		require.NoError(t, f.Update(t.Context(), obj))
 	}
 	require.NoError(t, unstructured.SetNestedMap(obj.Object, map[string]any{"phase": phase}, "status"))
 	require.NoError(t, f.Status().Update(t.Context(), obj))
-	if phase != "Reserved" && reservationProtected(obj) {
+	if !protected && reservationProtected(obj) {
 		obj.SetFinalizers(nil)
 		require.NoError(t, f.Update(t.Context(), obj))
 	}
@@ -974,4 +976,333 @@ func TestHamiReplacementRechecksReservationBeforeAssigningConsumer(t *testing.T)
 			require.True(t, hamiplacement.HasGate(pod))
 		})
 	}
+}
+
+func TestHamiPlacementOnlyWithDeferredGrant(t *testing.T) {
+	f := newHamiFixture(t, true)
+	f.job.Annotations[hamiplacement.AnnotationTargetOccupants] = `["small-1","small-2"]`
+	require.NoError(t, f.Update(t.Context(), f.job))
+	f.hamiEvict = func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error {
+		t.Fatal("the business controller owns eviction of the placement-only source")
+		return nil
+	}
+	for range 5 {
+		f.step(t)
+	}
+	reservation := gpuReservationObject(f.job)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(reservation), reservation))
+	occupants, _, err := unstructured.NestedStringSlice(reservation.Object, "spec", "allowedOccupantUIDs")
+	require.NoError(t, err)
+	require.Equal(t, []string{"small-1", "small-2"}, occupants)
+	_, ready := util.GetCondition(&f.job.Status, hamiplacement.ReadyCondition)
+	require.Equal(t, sev1alpha1.PodMigrationJobConditionStatusTrue, ready.Status)
+	_, protected := util.GetCondition(&f.job.Status, hamiplacement.TargetProtectedCondition)
+	require.Nil(t, protected)
+	f.setPhase(t, "Protecting")
+	for range 3 {
+		f.step(t)
+	}
+	require.Equal(t, string(reservation.GetUID()), f.job.Annotations[hamiplacement.AnnotationTargetUID])
+	_, protected = util.GetCondition(&f.job.Status, hamiplacement.TargetProtectedCondition)
+	require.NotNil(t, protected)
+	require.Equal(t, sev1alpha1.PodMigrationJobConditionStatusTrue, protected.Status)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(f.source), &corev1.Pod{}))
+
+	require.NoError(t, f.Delete(t.Context(), f.source))
+	pod := f.replacement(t)
+	require.Equal(t, reservation.GetName(), pod.Annotations[hamiplacement.AnnotationReservation])
+	f.step(t)
+	f.step(t)
+	require.Equal(t, pod.UID, f.job.Status.PodRef.UID)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(pod), pod))
+	require.True(t, hamiplacement.HasGate(pod))
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(reservation), reservation))
+	_, assigned, err := unstructured.NestedMap(reservation.Object, "spec", "consumerRef")
+	require.NoError(t, err)
+	require.False(t, assigned)
+
+	f.setPhase(t, "Reserved")
+	f.step(t)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(pod), pod))
+	require.False(t, hamiplacement.HasGate(pod))
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(reservation), reservation))
+	uid, _, err := unstructured.NestedString(reservation.Object, "spec", "consumerRef", "uid")
+	require.NoError(t, err)
+	require.Equal(t, string(pod.UID), uid)
+
+	pod.Spec.NodeName = "target"
+	pod.Annotations[hamiplacement.AnnotationAllocated] = "GPU-a,NVIDIA,1024,10:GPU-b,NVIDIA,1024,10:;"
+	require.NoError(t, f.Update(t.Context(), pod))
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	require.NoError(t, f.Status().Update(t.Context(), pod))
+	f.step(t)
+	require.Equal(t, sev1alpha1.PodMigrationJobRunning, f.job.Status.Phase)
+	f.setPhase(t, "Consumed")
+	f.step(t)
+	f.step(t)
+	require.Equal(t, sev1alpha1.PodMigrationJobSucceeded, f.job.Status.Phase)
+}
+
+func createHamiEvictionDependency(t *testing.T, f *hamiFixture, phase string) *unstructured.Unstructured {
+	t.Helper()
+	f.job.Annotations[hamiplacement.AnnotationRequiredTarget] = `{"name":"pmj-large","uid":"target-uid"}`
+	require.NoError(t, f.Update(t.Context(), f.job))
+	target := gpuReservationObject(f.job)
+	target.SetName("pmj-large")
+	target.SetUID("target-uid")
+	target.SetFinalizers([]string{gpuReservationProtectionFinalizer})
+	target.Object["spec"] = map[string]any{
+		"nodeName":  f.source.Spec.NodeName,
+		"expiresAt": f.now.Now().Add(2 * time.Minute).Format(time.RFC3339),
+	}
+	require.NoError(t, unstructured.SetNestedStringSlice(target.Object, []string{string(f.source.UID)}, "spec", "allowedOccupantUIDs"))
+	require.NoError(t, f.Create(t.Context(), target))
+	require.NoError(t, unstructured.SetNestedField(target.Object, phase, "status", "phase"))
+	require.NoError(t, f.Status().Update(t.Context(), target))
+	return target
+}
+
+func TestHamiDependentEvictionRequiresLiveProtectionAndPinsBothReservations(t *testing.T) {
+	f := newHamiFixture(t, false)
+	target := createHamiEvictionDependency(t, f, "Pending")
+	f.approveArbitration(t)
+	for range 4 {
+		f.step(t)
+	}
+	f.setPhase(t, "Reserved")
+	f.step(t)
+	calls := 0
+	f.hamiEvict = func(ctx context.Context, _ *sev1alpha1.PodMigrationJob, source *corev1.Pod) error {
+		calls++
+		require.NoError(t, f.Get(ctx, client.ObjectKeyFromObject(target), target))
+		var eviction hamiSourceEviction
+		require.NoError(t, json.Unmarshal([]byte(target.GetAnnotations()[hamiDependentEvictionAnnotation]), &eviction))
+		require.Equal(t, source.UID, eviction.UID)
+		require.Equal(t, source.ResourceVersion, eviction.ResourceVersion)
+		own := gpuReservationObject(f.job)
+		require.NoError(t, f.Get(ctx, client.ObjectKeyFromObject(own), own))
+		require.NotEmpty(t, own.GetAnnotations()[hamiSourceEvictionAnnotation])
+		if calls == 1 {
+			return apierrors.NewTooManyRequests("PDB rejected the eviction", 0)
+		}
+		return nil
+	}
+	f.step(t)
+	require.Zero(t, calls, "Pending cannot authorize eviction")
+	require.NoError(t, unstructured.SetNestedField(target.Object, "Protecting", "status", "phase"))
+	require.NoError(t, f.Status().Update(t.Context(), target))
+	f.now.Step(defaultRequeueAfter)
+	f.step(t)
+	require.Equal(t, 1, calls)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+	f.now.Step(defaultRequeueAfter)
+	f.step(t)
+	require.Equal(t, 2, calls)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.NotEmpty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation], "acceptance keeps the target pinned while the source exists")
+
+	require.NoError(t, f.Delete(t.Context(), target))
+	f.job.Spec.Paused = true
+	require.NoError(t, f.Update(t.Context(), f.job))
+	f.Reconciler = &Reconciler{Client: f.Client, hamiReader: f.hamiReader, args: f.args, clock: f.clock, hamiEvict: f.hamiEvict}
+	f.now.Step(f.job.Spec.TTL.Duration)
+	f.step(t)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.NotEmpty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+	require.NoError(t, f.Delete(t.Context(), f.source))
+	f.step(t)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+	require.Equal(t, 2, calls)
+}
+
+func armHamiDependentMigration(t *testing.T) (*hamiFixture, *unstructured.Unstructured) {
+	t.Helper()
+	f := newHamiFixture(t, false)
+	target := createHamiEvictionDependency(t, f, "Protecting")
+	f.approveArbitration(t)
+	for range 4 {
+		f.step(t)
+	}
+	f.setPhase(t, "Reserved")
+	f.step(t)
+	return f, target
+}
+
+func TestHamiDependentEvictionRejectsUnavailableProtection(t *testing.T) {
+	for _, scenario := range []string{"recreated UID", "wrong source", "wrong node", "unprotected", "expired", "other pin", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			f, target := armHamiDependentMigration(t)
+			f.hamiEvict = func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error {
+				t.Fatal("the changed reservation cannot authorize eviction")
+				return nil
+			}
+			switch scenario {
+			case "recreated UID":
+				target.SetFinalizers(nil)
+				require.NoError(t, f.Update(t.Context(), target))
+				require.NoError(t, f.Delete(t.Context(), target))
+				target.SetUID("different-target-uid")
+				target.SetResourceVersion("")
+				target.SetFinalizers([]string{gpuReservationProtectionFinalizer})
+				require.NoError(t, f.Create(t.Context(), target))
+			case "wrong source":
+				require.NoError(t, unstructured.SetNestedStringSlice(target.Object, []string{"other-pod-uid"}, "spec", "allowedOccupantUIDs"))
+			case "wrong node":
+				require.NoError(t, unstructured.SetNestedField(target.Object, "other-node", "spec", "nodeName"))
+			case "unprotected":
+				target.SetFinalizers(nil)
+			case "expired":
+				require.NoError(t, unstructured.SetNestedField(target.Object, f.now.Now().Format(time.RFC3339), "spec", "expiresAt"))
+			case "other pin":
+				target.SetAnnotations(map[string]string{hamiDependentEvictionAnnotation: "other attempt"})
+			case "canceled":
+				require.NoError(t, f.Delete(t.Context(), target))
+				require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+			}
+			require.NoError(t, f.Update(t.Context(), target))
+			f.step(t)
+			require.Equal(t, "HamiEvictionDeferred", f.job.Status.Reason)
+		})
+	}
+}
+
+func TestHamiDependentEvictionRecoversBeforePinCAS(t *testing.T) {
+	f, target := armHamiDependentMigration(t)
+	base := f.Client.(client.WithWatch)
+	var latePin client.Object
+	f.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if obj.GetUID() == target.GetUID() && obj.GetAnnotations()[hamiDependentEvictionAnnotation] != "" {
+				latePin = obj.DeepCopyObject().(client.Object)
+				panic("stopped before writing dependency pin")
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+	f.hamiEvict = func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error {
+		t.Fatal("the abandoned eviction must not be sent")
+		return nil
+	}
+	require.PanicsWithValue(t, "stopped before writing dependency pin", func() { _, _ = f.doMigrate(t.Context(), f.job) })
+
+	f.Reconciler = &Reconciler{Client: base, hamiReader: f.hamiReader, args: f.args, clock: f.clock, hamiEvict: f.hamiEvict}
+	f.step(t)
+	require.Equal(t, "HamiEvictionDeferred", f.job.Status.Reason)
+	require.NotContains(t, f.job.Finalizers, hamiEvictionRecoveryFinalizer)
+	require.True(t, apierrors.IsConflict(f.Update(t.Context(), latePin)), "a delayed update cannot create an orphaned pin")
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+}
+
+func TestHamiDependentEvictionRacesCancellationAtPinCAS(t *testing.T) {
+	f, target := armHamiDependentMigration(t)
+	base := f.Client.(client.WithWatch)
+	raced := false
+	f.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if obj.GetUID() == target.GetUID() && obj.GetAnnotations()[hamiDependentEvictionAnnotation] != "" {
+				require.Equal(t, target.GetResourceVersion(), obj.GetResourceVersion())
+				require.NoError(t, c.Delete(ctx, target, client.Preconditions{UID: ptr.To(target.GetUID()), ResourceVersion: ptr.To(target.GetResourceVersion())}))
+				raced = true
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+	f.hamiEvict = func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error {
+		t.Fatal("cancellation won the pin CAS")
+		return nil
+	}
+	f.step(t)
+	require.True(t, raced)
+	f.step(t)
+	require.NotContains(t, f.job.Finalizers, hamiEvictionRecoveryFinalizer)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.NotNil(t, target.GetDeletionTimestamp())
+	require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+}
+
+func TestHamiDependentEvictionUnknownOutcomeSurvivesJobDeletion(t *testing.T) {
+	f, target := armHamiDependentMigration(t)
+	calls := 0
+	f.hamiEvict = func(ctx context.Context, _ *sev1alpha1.PodMigrationJob, source *corev1.Pod) error {
+		calls++
+		source.Status.Conditions = []corev1.PodCondition{{
+			Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue, Reason: "EvictionByEvictionAPI",
+		}}
+		require.NoError(t, f.Status().Update(ctx, source))
+		return apierrors.NewTimeoutError("eviction response lost", 0)
+	}
+	_, err := f.doMigrate(t.Context(), f.job)
+	require.True(t, apierrors.IsTimeout(err))
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	marker := target.GetAnnotations()[hamiDependentEvictionAnnotation]
+	require.NotEmpty(t, marker)
+
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(f.job), f.job))
+	// Recovery uses the persisted checkpoint after edits to the requested dependency.
+	delete(f.job.Annotations, hamiplacement.AnnotationRequiredTarget)
+	f.job.Annotations[AnnotationJobCreatedBy] = "old-reconciler"
+	require.NoError(t, f.Update(t.Context(), f.job))
+	require.NoError(t, f.Delete(t.Context(), f.job))
+	require.NoError(t, f.Delete(t.Context(), target))
+	f.Reconciler = &Reconciler{Client: f.Client, hamiReader: f.hamiReader, args: f.args, clock: f.clock, hamiEvict: f.hamiEvict,
+		reconcilerUID: "new-reconciler", assumedCache: newAssumedCache()}
+	f.now.Step(3 * time.Minute)
+	f.step(t)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.Equal(t, marker, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+	require.Contains(t, f.job.Finalizers, hamiEvictionRecoveryFinalizer)
+	require.Equal(t, 1, calls)
+
+	require.NoError(t, f.Delete(t.Context(), f.source))
+	_, err = f.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(f.job)})
+	require.NoError(t, err)
+	require.True(t, apierrors.IsNotFound(f.Get(t.Context(), client.ObjectKeyFromObject(f.job), f.job)))
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
+}
+
+func TestHamiDoesNotCompleteForAnotherReservationConsumer(t *testing.T) {
+	f := armHamiMigration(t)
+	require.NoError(t, f.Delete(t.Context(), f.source))
+	pod := f.replacement(t)
+	f.step(t)
+	f.step(t)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(pod), pod))
+	require.False(t, hamiplacement.HasGate(pod))
+
+	reservation := gpuReservationObject(f.job)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(reservation), reservation))
+	require.NoError(t, unstructured.SetNestedField(reservation.Object, "another-pod-uid", "spec", "consumerRef", "uid"))
+	require.NoError(t, f.Update(t.Context(), reservation))
+	f.setPhase(t, "Consumed")
+	f.step(t)
+	require.Equal(t, sev1alpha1.PodMigrationJobFailed, f.job.Status.Phase)
+	require.Equal(t, "UnexpectedReservationConsumer", f.job.Status.Reason)
+}
+
+func TestHamiDependentEvictionDoesNotSubmitAfterTargetExpires(t *testing.T) {
+	f, target := armHamiDependentMigration(t)
+	require.NoError(t, unstructured.SetNestedField(target.Object, f.now.Now().Add(time.Second).Format(time.RFC3339), "spec", "expiresAt"))
+	require.NoError(t, f.Update(t.Context(), target))
+	f.Client = interceptor.NewClient(f.Client.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if job, ok := obj.(*sev1alpha1.PodMigrationJob); ok {
+				if _, started := util.GetCondition(&job.Status, hamiEvictionStartCondition); started != nil {
+					f.now.Step(time.Second)
+				}
+			}
+			return c.SubResource(subresource).Update(ctx, obj, opts...)
+		},
+	})
+	f.hamiEvict = func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error {
+		t.Fatal("the required target expired before eviction submission")
+		return nil
+	}
+	f.step(t)
+	require.Equal(t, "HamiEvictionDeferred", f.job.Status.Reason)
+	require.NoError(t, f.Get(t.Context(), client.ObjectKeyFromObject(target), target))
+	require.Empty(t, target.GetAnnotations()[hamiDependentEvictionAnnotation])
 }

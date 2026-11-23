@@ -81,6 +81,11 @@ func (r *Reconciler) hamiReservation(ctx context.Context, job *sev1alpha1.PodMig
 		if err := unstructured.SetNestedStringSlice(reservation.Object, placement.GPUUUIDs, "spec", "gpuUUIDs"); err != nil {
 			return nil, err
 		}
+		if len(placement.AllowedOccupantUIDs) > 0 {
+			if err := unstructured.SetNestedStringSlice(reservation.Object, placement.AllowedOccupantUIDs, "spec", "allowedOccupantUIDs"); err != nil {
+				return nil, err
+			}
+		}
 		return reservation, r.Create(ctx, reservation)
 	}
 	if err != nil {
@@ -90,9 +95,13 @@ func (r *Reconciler) hamiReservation(ctx context.Context, job *sev1alpha1.PodMig
 	uuids, _, _ := unstructured.NestedStringSlice(reservation.Object, "spec", "gpuUUIDs")
 	expiresAt, _, _ := unstructured.NestedString(reservation.Object, "spec", "expiresAt")
 	deadline, _ := time.Parse(time.RFC3339, expiresAt)
+	occupants, _, err := unstructured.NestedStringSlice(reservation.Object, "spec", "allowedOccupantUIDs")
 	slices.Sort(uuids)
-	if !ownedByHamiJob(reservation, job) || node != placement.NodeName ||
-		!slices.Equal(uuids, placement.GPUUUIDs) || !deadline.Equal(placement.ExpiresAt.Time) {
+	if err != nil || !ownedByHamiJob(reservation, job) || node != placement.NodeName ||
+		!slices.Equal(uuids, placement.GPUUUIDs) || !deadline.Equal(placement.ExpiresAt.Time) ||
+		!slices.Equal(occupants, placement.AllowedOccupantUIDs) ||
+		(len(placement.AllowedOccupantUIDs) > 0 && job.Annotations[hamiplacement.AnnotationTargetUID] != "" &&
+			job.Annotations[hamiplacement.AnnotationTargetUID] != string(reservation.GetUID())) {
 		return nil, fmt.Errorf("GPUReservation %s/%s does not match migration %s", reservation.GetNamespace(), reservation.GetName(), job.Name)
 	}
 	return reservation, nil
@@ -108,39 +117,72 @@ func reservationProtected(reservation *unstructured.Unstructured) bool {
 }
 
 func usableHamiReservation(reservation *unstructured.Unstructured, now time.Time) bool {
-	_, hasEvictionIntent := reservation.GetAnnotations()[hamiSourceEvictionAnnotation]
+	annotations := reservation.GetAnnotations()
+	_, hasEvictionIntent := annotations[hamiSourceEvictionAnnotation]
+	_, hasDependentEviction := annotations[hamiDependentEvictionAnnotation]
+	return !hasEvictionIntent && !hasDependentEviction && currentHamiProtection(reservation, now) && reservationPhase(reservation) == "Reserved"
+}
+
+func currentHamiProtection(reservation *unstructured.Unstructured, now time.Time) bool {
 	expiresAt, _, _ := unstructured.NestedString(reservation.Object, "spec", "expiresAt")
 	deadline, err := time.Parse(time.RFC3339, expiresAt)
-	return !hasEvictionIntent && err == nil && now.Before(deadline) && reservation.GetDeletionTimestamp() == nil &&
-		reservationPhase(reservation) == "Reserved" && reservationProtected(reservation)
+	return err == nil && now.Before(deadline) && reservation.GetDeletionTimestamp() == nil && reservationProtected(reservation)
+}
+
+func (r *Reconciler) reportHamiTargetProtection(ctx context.Context, job *sev1alpha1.PodMigrationJob, reservation *unstructured.Unstructured, armed bool) (bool, error) {
+	uid := string(reservation.GetUID())
+	if uid == "" {
+		return true, fmt.Errorf("GPUReservation %s/%s has no UID", reservation.GetNamespace(), reservation.GetName())
+	}
+	if job.Annotations[hamiplacement.AnnotationTargetUID] == "" {
+		job.Annotations[hamiplacement.AnnotationTargetUID] = uid
+		return true, r.Update(ctx, job)
+	}
+	_, previous := util.GetCondition(&job.Status, hamiplacement.TargetProtectedCondition)
+	phase := reservationPhase(reservation)
+	if armed && (phase == "Protecting" || phase == "Reserved") && currentHamiProtection(reservation, r.clock.Now()) {
+		if util.UpdateCondition(&job.Status, &sev1alpha1.PodMigrationJobCondition{
+			Type: hamiplacement.TargetProtectedCondition, Status: sev1alpha1.PodMigrationJobConditionStatusTrue,
+			Reason: "HamiSchedulerProtected", Message: uid,
+		}) {
+			return true, r.Status().Update(ctx, job)
+		}
+	} else if previous != nil && previous.Status == sev1alpha1.PodMigrationJobConditionStatusTrue {
+		util.UpdateCondition(&job.Status, &sev1alpha1.PodMigrationJobCondition{
+			Type: hamiplacement.TargetProtectedCondition, Status: sev1alpha1.PodMigrationJobConditionStatusFalse,
+			Reason: "HamiSchedulerProtectionEnded", Message: uid,
+		})
+		return true, r.Status().Update(ctx, job)
+	}
+	return false, nil
 }
 
 // commitHamiEviction takes the scheduler's hold on the same reservation
 // version that was checked before reading the PMJ. Cancellation and scheduler
 // retirement must win this same update race to release an uncommitted grant.
-func (r *Reconciler) commitHamiEviction(ctx context.Context, reservation *unstructured.Unstructured, source *corev1.Pod, attempt string) (string, error) {
+func hamiEvictionMarker(source *corev1.Pod, attempt string) (string, error) {
 	payload, err := json.Marshal(hamiSourceEviction{
 		Name: source.Name, UID: source.UID, ResourceVersion: source.ResourceVersion, Attempt: attempt,
 	})
-	if err != nil {
-		return "", err
-	}
-	marker := string(payload)
+	return string(payload), err
+}
+
+func (r *Reconciler) commitHamiEviction(ctx context.Context, reservation *unstructured.Unstructured, annotation, marker string) error {
 	annotations := reservation.GetAnnotations()
 	if annotations == nil {
 		annotations = make(map[string]string)
 	}
-	annotations[hamiSourceEvictionAnnotation] = marker
+	annotations[annotation] = marker
 	reservation.SetAnnotations(annotations)
 	// Update contains both the live UID (immutable) and resourceVersion.
-	return marker, r.Update(ctx, reservation)
+	return r.Update(ctx, reservation)
 }
 
 // clearHamiEviction must only follow a definitive Eviction result or a
 // locally abandoned submission. A different attempt or reservation UID
 // must survive retries.
-func (r *Reconciler) clearHamiEviction(ctx context.Context, reservation *unstructured.Unstructured, marker string) error {
-	if marker == "" {
+func (r *Reconciler) clearHamiEviction(ctx context.Context, reservation *unstructured.Unstructured, annotation, marker string) error {
+	if reservation == nil || marker == "" {
 		return nil
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -150,10 +192,10 @@ func (r *Reconciler) clearHamiEviction(ctx context.Context, reservation *unstruc
 			return client.IgnoreNotFound(err)
 		}
 		annotations := current.GetAnnotations()
-		if current.GetUID() != reservation.GetUID() || annotations[hamiSourceEvictionAnnotation] != marker {
+		if current.GetUID() != reservation.GetUID() || annotations[annotation] != marker {
 			return nil
 		}
-		delete(annotations, hamiSourceEvictionAnnotation)
+		delete(annotations, annotation)
 		current.SetAnnotations(annotations)
 		return r.Update(ctx, current)
 	})
@@ -204,6 +246,9 @@ func (r *Reconciler) persistHamiEvictionOutcome(ctx context.Context, job *sev1al
 }
 
 func (r *Reconciler) recoverHamiEviction(ctx context.Context, job *sev1alpha1.PodMigrationJob) error {
+	if _, dependency := util.GetCondition(&job.Status, hamiEvictionDependencyCondition); dependency != nil {
+		return r.recoverHamiDependentEviction(ctx, job, dependency.Message)
+	}
 	if job.Spec.PodRef == nil || job.Spec.PodRef.Namespace == "" {
 		return fmt.Errorf("PodMigrationJob %s lost its source namespace during eviction recovery", job.Name)
 	}
@@ -217,6 +262,10 @@ func (r *Reconciler) recoverHamiEviction(ctx context.Context, job *sev1alpha1.Po
 			return r.recoverHamiEvictionAttempt(ctx, job, reservation, marker)
 		}
 	}
+	return r.finishHamiEvictionRecovery(ctx, job)
+}
+
+func (r *Reconciler) finishHamiEvictionRecovery(ctx context.Context, job *sev1alpha1.PodMigrationJob) error {
 	recovered := job.DeepCopy()
 	recovered.Finalizers = slices.DeleteFunc(recovered.Finalizers, func(value string) bool { return value == hamiEvictionRecoveryFinalizer })
 	if err := r.Update(ctx, recovered); err != nil {
@@ -230,7 +279,7 @@ func (r *Reconciler) recoverHamiEvictionAttempt(ctx context.Context, job *sev1al
 	attempt := string(reservation.GetUID()) + "/" + marker
 	_, recorded := util.GetCondition(&job.Status, hamiEvictionOutcomeCondition)
 	if recorded != nil && recorded.Status == sev1alpha1.PodMigrationJobConditionStatusTrue && recorded.Message == attempt {
-		return r.clearHamiEviction(ctx, reservation, marker)
+		return r.clearHamiEviction(ctx, reservation, hamiSourceEvictionAnnotation, marker)
 	}
 	var source hamiSourceEviction
 	if err := json.Unmarshal([]byte(marker), &source); err != nil || source.Name == "" || source.UID == "" || source.ResourceVersion == "" {
@@ -251,7 +300,7 @@ func (r *Reconciler) recoverHamiEvictionAttempt(ctx context.Context, job *sev1al
 			return err
 		}
 		*job = *recovered
-		return r.clearHamiEviction(ctx, reservation, marker)
+		return r.clearHamiEviction(ctx, reservation, hamiSourceEvictionAnnotation, marker)
 	}
 	pod := &corev1.Pod{}
 	err := r.hamiReader.Get(ctx, client.ObjectKey{Namespace: reservation.GetNamespace(), Name: source.Name}, pod)
@@ -261,7 +310,13 @@ func (r *Reconciler) recoverHamiEvictionAttempt(ctx context.Context, job *sev1al
 	if err == nil && pod.UID == source.UID && pod.DeletionTimestamp.IsZero() {
 		return nil
 	}
-	return r.clearHamiEviction(ctx, reservation, marker)
+	return r.clearHamiEviction(ctx, reservation, hamiSourceEvictionAnnotation, marker)
+}
+
+func hamiReservationConsumerMatches(reservation *unstructured.Unstructured, pod *corev1.Pod) bool {
+	name, _, _ := unstructured.NestedString(reservation.Object, "spec", "consumerRef", "name")
+	uid, _, _ := unstructured.NestedString(reservation.Object, "spec", "consumerRef", "uid")
+	return name == pod.Name && uid == string(pod.UID)
 }
 
 func (r *Reconciler) assignHamiReservation(ctx context.Context, reservation *unstructured.Unstructured, pod *corev1.Pod) error {

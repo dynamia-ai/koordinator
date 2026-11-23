@@ -36,24 +36,28 @@ import (
 )
 
 const (
-	RecoveryEvictableLabel  = "hami.io/recovery-evictable"
-	AnnotationNode          = "hami.io/target-node"
-	AnnotationUUIDs         = "hami.io/target-gpu-uuids"
-	AnnotationPlacementOnly = "hami.io/placement-only"
-	AnnotationJobUID        = "hami.io/placement-job-uid"
-	AnnotationReservation   = "hami.io/gpu-reservation"
-	AnnotationUseUUID       = "nvidia.com/use-gpuuuid"
-	AnnotationAllocated     = "hami.io/vgpu-devices-allocated"
-	ManagedNamespaceLabel   = "hami.io/managed-placement"
-	SchedulingGate          = "hami.io/placement"
-	SchedulerName           = "hami-scheduler"
-	WebhookPath             = "/mutate-hami-placement"
+	RecoveryEvictableLabel    = "hami.io/recovery-evictable"
+	AnnotationNode            = "hami.io/target-node"
+	AnnotationUUIDs           = "hami.io/target-gpu-uuids"
+	AnnotationPlacementOnly   = "hami.io/placement-only"
+	AnnotationTargetOccupants = "hami.io/target-reservation-occupants"
+	AnnotationTargetUID       = "hami.io/target-reservation-uid"
+	AnnotationRequiredTarget  = "hami.io/required-target-reservation"
+	AnnotationJobUID          = "hami.io/placement-job-uid"
+	AnnotationReservation     = "hami.io/gpu-reservation"
+	AnnotationUseUUID         = "nvidia.com/use-gpuuuid"
+	AnnotationAllocated       = "hami.io/vgpu-devices-allocated"
+	ManagedNamespaceLabel     = "hami.io/managed-placement"
+	SchedulingGate            = "hami.io/placement"
+	SchedulerName             = "hami-scheduler"
+	WebhookPath               = "/mutate-hami-placement"
 )
 
 const (
-	ReadyCondition       sev1alpha1.PodMigrationJobConditionType = "HamiPlacementReady"
-	LockCondition        sev1alpha1.PodMigrationJobConditionType = "HamiPlacementLock"
-	ArbitrationCondition sev1alpha1.PodMigrationJobConditionType = "HamiArbitration"
+	ReadyCondition           sev1alpha1.PodMigrationJobConditionType = "HamiPlacementReady"
+	TargetProtectedCondition sev1alpha1.PodMigrationJobConditionType = "HamiTargetProtected"
+	LockCondition            sev1alpha1.PodMigrationJobConditionType = "HamiPlacementLock"
+	ArbitrationCondition     sev1alpha1.PodMigrationJobConditionType = "HamiArbitration"
 )
 
 func PassedArbitration(job *sev1alpha1.PodMigrationJob) bool {
@@ -67,19 +71,26 @@ func PassedArbitration(job *sev1alpha1.PodMigrationJob) bool {
 }
 
 type Placement struct {
-	SourceName  string      `json:"sourceName"`
-	JobUID      types.UID   `json:"jobUID"`
-	SourceUID   types.UID   `json:"sourceUID"`
-	OwnerUID    types.UID   `json:"ownerUID"`
-	SiblingUIDs []types.UID `json:"siblingUIDs,omitempty"`
-	NodeName    string      `json:"nodeName"`
-	GPUUUIDs    []string    `json:"gpuUUIDs"`
-	Reservation string      `json:"reservation,omitempty"`
-	ExpiresAt   metav1.Time `json:"expiresAt"`
+	SourceName          string                `json:"sourceName"`
+	JobUID              types.UID             `json:"jobUID"`
+	SourceUID           types.UID             `json:"sourceUID"`
+	OwnerUID            types.UID             `json:"ownerUID"`
+	SiblingUIDs         []types.UID           `json:"siblingUIDs,omitempty"`
+	NodeName            string                `json:"nodeName"`
+	GPUUUIDs            []string              `json:"gpuUUIDs"`
+	Reservation         string                `json:"reservation,omitempty"`
+	ExpiresAt           metav1.Time           `json:"expiresAt"`
+	AllowedOccupantUIDs []string              `json:"allowedOccupantUIDs,omitempty"`
+	RequiredTarget      *ReservationReference `json:"requiredTarget,omitempty"`
+}
+
+type ReservationReference struct {
+	Name string    `json:"name"`
+	UID  types.UID `json:"uid"`
 }
 
 func Requested(annotations map[string]string) bool {
-	for _, key := range []string{AnnotationNode, AnnotationUUIDs, AnnotationPlacementOnly} {
+	for _, key := range []string{AnnotationNode, AnnotationUUIDs, AnnotationPlacementOnly, AnnotationTargetOccupants, AnnotationRequiredTarget} {
 		if _, found := annotations[key]; found {
 			return true
 		}

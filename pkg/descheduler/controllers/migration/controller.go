@@ -19,6 +19,7 @@ package migration
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -263,9 +264,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	// NOTE:
 	// 1. only the PMJs created by MigrationController have annotation AnnotationJobCreatedBy, if a PMJ was created
 	//    manually by users, we should handle it anyway.
-	// 2. if a PMJ was indeed created by MigrationController but koord-descheduler has restarted(new UUID generated),
-	//    we just ignore it.
-	if jobUID, ok := job.Annotations[AnnotationJobCreatedBy]; ok && jobUID != string(r.reconcilerUID) {
+	// A persisted eviction checkpoint still needs reconciliation across leaders.
+	if jobUID, ok := job.Annotations[AnnotationJobCreatedBy]; ok && jobUID != string(r.reconcilerUID) &&
+		!slices.Contains(job.Finalizers, hamiEvictionRecoveryFinalizer) {
 		return reconcile.Result{}, nil
 	}
 
