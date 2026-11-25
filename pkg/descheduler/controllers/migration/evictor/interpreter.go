@@ -66,7 +66,12 @@ type interpreterImpl struct {
 	eventRecorder  events.EventRecorder
 }
 
-func NewInterpreter(handle framework.Handle, defaultEvictionPolicy string, evictQPS float32, evictBurst int) (Interpreter, error) {
+type PolicyInterpreter interface {
+	Interpreter
+	EvictNative(ctx context.Context, job *sev1alpha1.PodMigrationJob, pod *corev1.Pod) error
+}
+
+func NewInterpreter(handle framework.Handle, defaultEvictionPolicy string, evictQPS float32, evictBurst int) (PolicyInterpreter, error) {
 	rateLimiter := flowcontrol.NewTokenBucketRateLimiter(evictQPS, evictBurst)
 
 	evictors := map[string]Interface{}
@@ -90,11 +95,6 @@ func NewInterpreter(handle framework.Handle, defaultEvictionPolicy string, evict
 }
 
 func (p *interpreterImpl) Evict(ctx context.Context, job *sev1alpha1.PodMigrationJob, pod *corev1.Pod) error {
-	if p.rateLimiter != nil {
-		if !p.rateLimiter.TryAccept() {
-			return ErrTooManyEvictions
-		}
-	}
 	evictionPolicy := getCustomEvictionPolicy(pod.Labels)
 	if evictionPolicy == "" {
 		evictionPolicy = getCustomEvictionPolicy(job.Labels)
@@ -108,8 +108,23 @@ func (p *interpreterImpl) Evict(ctx context.Context, job *sev1alpha1.PodMigratio
 		evictor = p.defaultEvictor
 	}
 
+	return p.evict(ctx, job, pod, evictor.Evict)
+}
+
+func (p *interpreterImpl) EvictNative(ctx context.Context, job *sev1alpha1.PodMigrationJob, pod *corev1.Pod) error {
+	native, ok := p.evictors[NativeEvictorName].(*NativeEvictor)
+	if !ok {
+		return fmt.Errorf("native Eviction API is unavailable")
+	}
+	return p.evict(ctx, job, pod, native.evictOnce)
+}
+
+func (p *interpreterImpl) evict(ctx context.Context, job *sev1alpha1.PodMigrationJob, pod *corev1.Pod, evict func(context.Context, *sev1alpha1.PodMigrationJob, *corev1.Pod) error) error {
+	if p.rateLimiter != nil && !p.rateLimiter.TryAccept() {
+		return ErrTooManyEvictions
+	}
 	trigger, reason := GetEvictionTriggerAndReason(job.Annotations)
-	err := evictor.Evict(ctx, job, pod)
+	err := evict(ctx, job, pod)
 	if err != nil {
 		metrics.PodsEvicted.With(map[string]string{"result": "error", "strategy": trigger, "namespace": pod.Namespace, "node": pod.Spec.NodeName}).Inc()
 		return err

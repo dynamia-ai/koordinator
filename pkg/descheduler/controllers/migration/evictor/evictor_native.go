@@ -21,6 +21,8 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	sev1alpha1 "github.com/koordinator-sh/koordinator/apis/scheduling/v1alpha1"
@@ -58,4 +60,24 @@ func NewNativeEvictor(client kubernetes.Interface) (Interface, error) {
 
 func (e *NativeEvictor) Evict(ctx context.Context, job *sev1alpha1.PodMigrationJob, pod *corev1.Pod) error {
 	return evictions.EvictPod(ctx, e.client, pod, e.policyGroupVersion, job.Spec.DeleteOptions)
+}
+
+// evictOnce gives each protected HAMi attempt a single server response.
+// Retrying a 429 bypasses the next PMJ pause check. Retrying a 5xx can hide
+// an ambiguous result behind a definitive rejection from a later request.
+func (e *NativeEvictor) evictOnce(ctx context.Context, job *sev1alpha1.PodMigrationJob, pod *corev1.Pod) error {
+	eviction := &policyv1.Eviction{
+		ObjectMeta:    metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name},
+		DeleteOptions: job.Spec.DeleteOptions,
+	}
+	return e.client.PolicyV1().RESTClient().Post().
+		AbsPath("/api/v1").
+		Namespace(pod.Namespace).
+		Resource("pods").
+		Name(pod.Name).
+		SubResource("eviction").
+		Body(eviction).
+		MaxRetries(0).
+		Do(ctx).
+		Error()
 }

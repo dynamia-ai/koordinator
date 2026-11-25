@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: koord-descheduler
+  namespace: koordinator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: koord-hami-placement-descheduler
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, nodes, pods]
+    verbs: [get, list, watch]
+  - apiGroups: ["", events.k8s.io]
+    resources: [events]
+    verbs: [create, patch, update]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets]
+    verbs: [get, list, watch]
+  - apiGroups: [apps.kruise.io]
+    resources: [clonesets]
+    verbs: [get, list, watch]
+  - apiGroups: [scheduling.k8s.io]
+    resources: [priorityclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [scheduling.koordinator.sh]
+    resources: [podmigrationjobs, reservations]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [scheduling.koordinator.sh]
+    resources: [podmigrationjobs/status]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: koord-hami-placement-descheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: koord-hami-placement-descheduler
+subjects:
+  - kind: ServiceAccount
+    name: koord-descheduler
+    namespace: koordinator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: koord-hami-placement-leader-election
+  namespace: koordinator-system
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [koord-descheduler]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: koord-hami-placement-leader-election
+  namespace: koordinator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: koord-hami-placement-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: koord-descheduler
+    namespace: koordinator-system

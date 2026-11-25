@@ -197,7 +197,7 @@ func TestFiltering(t *testing.T) {
 					},
 				},
 			}
-			isFailed, isPassed := arbitrator.filtering(testCase.pod)
+			isFailed, isPassed := arbitrator.filtering(nil, testCase.pod)
 			assert.Equal(t, testCase.isFailed, isFailed)
 			assert.Equal(t, testCase.isPassed, isPassed)
 		})

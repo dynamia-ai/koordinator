@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: koordinator-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-recovery-demo
+  labels:
+    hami.io/managed-placement: "true"

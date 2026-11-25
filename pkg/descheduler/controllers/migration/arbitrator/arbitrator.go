@@ -32,6 +32,8 @@ import (
 
 	"github.com/koordinator-sh/koordinator/apis/scheduling/v1alpha1"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/apis/config"
+	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/hamiplacement"
+	"github.com/koordinator-sh/koordinator/pkg/descheduler/controllers/migration/util"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/framework"
 	"github.com/koordinator-sh/koordinator/pkg/descheduler/utils/sorter"
 )
@@ -111,6 +113,11 @@ func (a *arbitratorImpl) AddPodMigrationJob(job *v1alpha1.PodMigrationJob) {
 // It is safe to be called concurrently by multiple goroutines.
 func (a *arbitratorImpl) DeletePodMigrationJob(job *v1alpha1.PodMigrationJob) {
 	a.filter.removeJobPassedArbitration(job.UID)
+	if hamiplacement.Requested(job.Annotations) {
+		a.mu.Lock()
+		delete(a.waitingCollection, job.UID)
+		a.mu.Unlock()
+	}
 }
 
 // Start starts the goroutine to arbitrate jobs periodically.
@@ -154,10 +161,19 @@ func (a *arbitratorImpl) sort(jobs []*v1alpha1.PodMigrationJob, podOfJob map[*v1
 }
 
 // filtering calls nonRetryablePodFilter and retryablePodFilter to filter one PodMigrationJob.
-func (a *arbitratorImpl) filtering(pod *corev1.Pod) (isFailed, isPassed bool) {
+func (a *arbitratorImpl) filtering(job *v1alpha1.PodMigrationJob, pod *corev1.Pod) (isFailed, isPassed bool) {
 	if pod != nil {
 		markPodArbitrating(pod)
-		if a.filter.nonRetryablePodFilter != nil && !a.filter.nonRetryablePodFilter(pod) {
+		filterPod := a.filter.nonRetryablePodFilter
+		allowEmptyDir, err := a.filter.allowsHamiEmptyDir(job, pod)
+		if err != nil {
+			klog.ErrorS(err, "Failed to verify HAMi placement namespace", "pod", klog.KObj(pod))
+			return false, false
+		}
+		if allowEmptyDir {
+			filterPod = a.filter.hamiEmptyDirPodFilter
+		}
+		if filterPod != nil && !filterPod(pod) {
 			isFailed = true
 			return
 		}
@@ -172,12 +188,20 @@ func (a *arbitratorImpl) filtering(pod *corev1.Pod) (isFailed, isPassed bool) {
 
 // updatePassedJob does something after PodMigrationJob passed the filter.
 func (a *arbitratorImpl) updatePassedJob(job *v1alpha1.PodMigrationJob) {
-	// add annotation AnnotationPassedArbitration
-	if job.Annotations == nil {
-		job.Annotations = map[string]string{}
+	var err error
+	if hamiplacement.Requested(job.Annotations) {
+		util.UpdateCondition(&job.Status, &v1alpha1.PodMigrationJobCondition{
+			Type: hamiplacement.ArbitrationCondition, Status: v1alpha1.PodMigrationJobConditionStatusTrue,
+			Reason: "HamiArbitrationPassed", Message: string(job.Spec.PodRef.UID),
+		})
+		err = a.client.Status().Update(context.TODO(), job)
+	} else {
+		if job.Annotations == nil {
+			job.Annotations = map[string]string{}
+		}
+		job.Annotations[AnnotationPassedArbitration] = "true"
+		err = a.client.Update(context.TODO(), job)
 	}
-	job.Annotations[AnnotationPassedArbitration] = "true"
-	err := a.client.Update(context.TODO(), job)
 	if err != nil {
 		klog.ErrorS(err, "failed to update job", "job", klog.KObj(job))
 	} else {
@@ -205,7 +229,12 @@ func (a *arbitratorImpl) doOnceArbitrate() {
 	// filter
 	for _, job := range jobs {
 		pod := podOfJob[job]
-		isFailed, isPassed := a.filtering(pod)
+		if hamiplacement.Requested(job.Annotations) &&
+			(pod == nil || job.Spec.PodRef == nil || job.Spec.PodRef.UID != pod.UID) {
+			a.updateFailedJob(job, pod)
+			continue
+		}
+		isFailed, isPassed := a.filtering(job, pod)
 		if isFailed {
 			a.updateFailedJob(job, pod)
 			continue

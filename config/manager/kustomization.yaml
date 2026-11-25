@@ -2,7 +2,7 @@ resources:
   - manager.yaml
   - scheduler.yaml
   - scheduler-config.yaml
-  - descheduler.yaml
+  - descheduler
   - descheduler-config.yaml
   - koordlet.yaml
   - koord-batch.yaml

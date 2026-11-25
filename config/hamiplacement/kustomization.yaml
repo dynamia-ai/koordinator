@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../manager/descheduler
+  - ../crd/bases
+  - namespace.yaml
+  - descheduler-config.yaml
+  - descheduler-rbac.yaml
+  - certificates.yaml
+  - serving.yaml
+  - workload-rbac.yaml
+images:
+  - name: descheduler
+    newName: koord-descheduler
+    newTag: hami-recovery
+patches:
+  - target:
+      kind: Deployment
+      name: descheduler
+      namespace: system
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: koord-descheduler
+      - op: replace
+        path: /metadata/namespace
+        value: koordinator-system
+  - path: deployment-patch.yaml

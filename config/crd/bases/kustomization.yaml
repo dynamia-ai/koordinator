@@ -1,0 +1,6 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# MigrationController watches both types, including Reservation in direct mode.
+resources:
+  - scheduling.koordinator.sh_podmigrationjobs.yaml
+  - scheduling.koordinator.sh_reservations.yaml

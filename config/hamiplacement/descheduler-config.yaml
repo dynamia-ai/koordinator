@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: koord-descheduler-config
+  namespace: koordinator-system
+data:
+  koord-descheduler-config: |
+    apiVersion: descheduler/v1alpha2
+    kind: DeschedulerConfiguration
+    healthzBindAddress: 0.0.0.0:10251
+    metricsBindAddress: 0.0.0.0:10251
+    leaderElection:
+      resourceLock: leases
+      resourceName: koord-descheduler
+      resourceNamespace: koordinator-system
+    deschedulingInterval: 10s
+    profiles:
+    - name: koord-descheduler
+      plugins:
+        deschedule:
+          disabled:
+            - name: "*"
+        evict:
+          disabled:
+            - name: "*"
+          enabled:
+            - name: MigrationController
+      pluginConfig:
+      - name: MigrationController
+        args:
+          apiVersion: descheduler/v1alpha2
+          kind: MigrationControllerArgs
+          evictionPolicy: Eviction
+          defaultJobMode: EvictDirectly
+          namespaces:
+            include:
+              - gpu-recovery-demo
+          objectLimiters:
+            workload:
+              duration: 2m

@@ -94,6 +94,7 @@ func TestFilterMaxMigratingGlobally(t *testing.T) {
 		name                     string
 		numMigratingPodsGlobally int
 		samePod                  bool
+		placementOnly            bool
 		maxMigratingGlobally     int32
 		want                     bool
 	}{
@@ -110,6 +111,13 @@ func TestFilterMaxMigratingGlobally(t *testing.T) {
 			name:                     "maxMigratingGlobally=1 one migrating same Pod",
 			numMigratingPodsGlobally: 1,
 			samePod:                  true,
+			maxMigratingGlobally:     1,
+			want:                     true,
+		},
+		{
+			name:                     "maxMigrating=1 with a placement-only job",
+			numMigratingPodsGlobally: 1,
+			placementOnly:            true,
 			maxMigratingGlobally:     1,
 			want:                     true,
 		},
@@ -179,6 +187,9 @@ func TestFilterMaxMigratingGlobally(t *testing.T) {
 					},
 				}
 				a.markJobPassedArbitration(job.UID)
+				if tt.placementOnly {
+					job.Annotations["hami.io/placement-only"] = "true"
+				}
 				assert.Nil(t, a.client.Create(context.TODO(), job))
 			}
 
